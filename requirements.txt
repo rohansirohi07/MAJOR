@@ -1,0 +1,7 @@
+flask>=3.0
+torch>=2.2
+torchvision
+timm>=1.0
+opencv-python-headless
+numpy
+pandas
