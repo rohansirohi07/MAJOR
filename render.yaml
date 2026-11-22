@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: netra-dr-app
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 2 --timeout 180
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MODEL_URL
+        sync: false

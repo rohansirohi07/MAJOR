@@ -1,7 +1,8 @@
 """Flask backend for the Netra diabetic retinopathy detector (PyTorch ConvNeXt-Base)."""
 import json
+import os
 import threading
-import zipfile
+import urllib.request
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from doctors import DoctorDirectory
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "models"
 MODEL_PATH = MODEL_DIR / "best_convnext_fold0.pth"   # state_dict saved by torch.save
+MODEL_URL = os.environ.get("MODEL_URL")              # direct download link (Hugging Face) used on Render
 ALLOWED_EXT = {"png", "jpg", "jpeg", "bmp"}
 LOW_CONFIDENCE = 0.55
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,38 +41,14 @@ _model = None
 _lock = threading.Lock()
 
 
-def resolve_model_file():
-    """Return a real checkpoint file. If the .pth was extracted into a folder
-    (a common mistake on Windows), pack it back into a proper .pth archive."""
-    if MODEL_PATH.is_file():
-        return MODEL_PATH
-    if MODEL_PATH.is_dir():
-        pkl = next(MODEL_PATH.rglob("data.pkl"), None)
-        if pkl is not None:
-            root = pkl.parent
-            rebuilt = MODEL_DIR / "best_convnext_fold0_rebuilt.pth"
-            if not rebuilt.exists():
-                print("Model folder found instead of a file. Repacking it as a .pth (one time)...")
-                tmp = MODEL_DIR / "rebuilding.tmp"
-                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
-                    for f in sorted(root.rglob("*")):
-                        if f.is_file():
-                            info = zipfile.ZipInfo(f"{root.name}/{f.relative_to(root).as_posix()}",
-                                                   date_time=(2020, 1, 1, 0, 0, 0))
-                            info.compress_type = zipfile.ZIP_STORED
-                            z.writestr(info, f.read_bytes())
-                tmp.replace(rebuilt)
-            return rebuilt
-    raise FileNotFoundError(MODEL_PATH)
-
-
 def get_model():
     """Build ConvNeXt-Base, load the trained weights once, keep it in memory."""
     global _model
     with _lock:
         if _model is None:
+            ensure_model_file()
             net = timm.create_model("convnext_base", pretrained=False, num_classes=CONFIG["num_classes"])
-            state = torch.load(resolve_model_file(), map_location="cpu", weights_only=True)
+            state = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
             if isinstance(state, dict) and "state_dict" in state:
                 state = state["state_dict"]
             state = {k.replace("module.", "", 1): v for k, v in state.items()}
@@ -128,8 +106,9 @@ def predict():
 
     try:
         model = get_model()
-    except FileNotFoundError:
-        return jsonify(error="Model file not found. Put best_convnext_fold0.pth inside the models folder and restart."), 503
+    except Exception as e:
+        print("Model load failed:", e)
+        return jsonify(error="The model is still loading or could not be loaded. Please try again in a minute."), 503
     start = time.perf_counter()
     with torch.inference_mode():
         probs = torch.softmax(model(batch.to(DEVICE)), dim=1)[0].cpu().numpy()
@@ -193,9 +172,18 @@ def too_large(_):
     return jsonify(error="That image is larger than 10 MB. Use a smaller file."), 413
 
 
-if __name__ == "__main__":
+def _warm_up():
+    """Load the model in the background so the first prediction is fast
+    (gunicorn on Render never runs the __main__ block)."""
     try:
-        get_model()  # load once at start so the first prediction is fast
-    except FileNotFoundError:
-        print("WARNING: models/best_convnext_fold0.pth is missing. Copy your trained file there.")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+        get_model()
+    except Exception as e:
+        print("Model warm-up failed:", e)
+
+
+if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+    threading.Thread(target=_warm_up, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0" if os.environ.get("PORT") else "127.0.0.1", port=port, debug=False)
